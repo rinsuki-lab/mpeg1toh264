@@ -87,7 +87,13 @@ pictures. A top and bottom field pair forms one frame.
 
 ## Input and output
 
-Input may be an MPEG-2 Video elementary stream or an MPEG transport stream with 188-byte packets. For transport streams, MPEG-2 Video (stream type `0x02`) and AAC-LC from the same service are selected through the PAT/PMT.
+Input may be an MPEG-1/2 Video elementary stream or an MPEG transport stream with 188-byte packets. For transport streams, MPEG-1/2 Video (stream type `0x01` or `0x02`) and AAC-LC from the same service are selected through the PAT/PMT.
+
+Remux MPEG-PS (`.mpg`) or 192-byte M2TS input to 188-byte TS first. This command copies the compressed video unchanged and converts only audio to AAC:
+
+```bash
+ffmpeg -i input.mpg -map 0:v:0 -map '0:a:0?' -c:v copy -c:a aac -f mpegts -mpegts_m2ts_mode 0 input.ts
+```
 
 Output:
 
@@ -116,7 +122,7 @@ AAC is not re-encoded. Ordinary stereo and 5.1-channel audio are preserved. Mono
 
 Main limitations:
 
-- Video support covers MPEG-2 I/P/B pictures and 4:2:0 chroma.
+- Video support covers MPEG-1/2 I/P/B pictures and 4:2:0 chroma. MPEG-1 D pictures are not supported.
 - Resolution changes or switches between progressive and interlaced sequences during conversion are not supported.
 - Transport-stream audio must be AAC-LC; channel-element rearrangement supports 44.1 kHz and 48 kHz.
 - Corrupt slices, leading B pictures without all references, and unpaired field pictures are skipped.
@@ -270,7 +276,13 @@ Open GOP境界付近のアクセスユニットは次のようになります。
 
 ## 入出力
 
-入力はMPEG-2 Video ES、または188バイトパケットのMPEG-TSです。TSではPAT/PMTから同一サービスのMPEG-2 Video(stream type `0x02`)とAAC-LCを選びます。
+入力はMPEG-1/2 Video ES、または188バイトパケットのMPEG-TSです。TSではPAT/PMTから同一サービスのMPEG-1/2 Video(stream type `0x01`または`0x02`)とAAC-LCを選びます。
+
+MPEG-PS (`.mpg`)や192バイトのM2TSは、先に188バイトのTSへ詰め替えます。次のコマンドは圧縮された映像をそのままコピーし、音声だけをAACへ変換します。
+
+```bash
+ffmpeg -i input.mpg -map 0:v:0 -map '0:a:0?' -c:v copy -c:a aac -f mpegts -mpegts_m2ts_mode 0 input.ts
+```
 
 出力:
 
@@ -299,7 +311,7 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
 
 主な制約:
 
-- 映像はMPEG-2のI/P/Bピクチャと4:2:0を対象とする
+- 映像はMPEG-1/2のI/P/Bピクチャと4:2:0を対象とする。MPEG-1のDピクチャは未対応
 - 変換中の解像度またはプログレッシブ/インターレースシーケンスの変更は不可
 - TSの音声はAAC-LC、チャンネルエレメントの組み替えは44.1 kHzまたは48 kHzを対象とする
 - 破損スライス、参照が揃わない先頭Bピクチャ、片方だけのフィールドピクチャは読み飛ばす

@@ -220,6 +220,52 @@ pub fn inter_targets(
     finish_mismatch_control(out, parity);
 }
 
+/// MPEG-1 corrects each coded coefficient to an odd value before saturation,
+/// rather than correcting the parity of the whole block as MPEG-2 does.
+#[inline]
+fn mpeg1_coefficient(magnitude: i32, sign: i32) -> f32 {
+    (((magnitude - 1) | 1) * sign).clamp(-2048, 2047) as f32
+}
+
+/// MPEG-1 intra inverse quantisation, minus the flat prediction. The shared
+/// parser stores twice quantiser_scale_code, as in MPEG-2's linear scale table.
+/// MPEG-1 intra DC always has eight-bit precision and is not oddified.
+pub fn mpeg1_intra_targets(
+    levels: &[i16; 64],
+    weight_scale: &[i32; 64],
+    quantiser_scale: i32,
+    out: &mut [f32; 64],
+) {
+    out[0] = (8 * levels[0] as i32).clamp(-2048, 2047) as f32 - FLAT_PREDICTION_DC;
+    for pos in 1..64 {
+        let level = levels[pos] as i32;
+        out[pos] = if level == 0 {
+            0.0
+        } else {
+            let magnitude = level.abs() * weight_scale[pos] * quantiser_scale / 16;
+            mpeg1_coefficient(magnitude, level.signum())
+        };
+    }
+}
+
+/// MPEG-1 non-intra inverse quantisation, using twice quantiser_scale_code.
+pub fn mpeg1_inter_targets(
+    levels: &[i16; 64],
+    weight_scale: &[i32; 64],
+    quantiser_scale: i32,
+    out: &mut [f32; 64],
+) {
+    for pos in 0..64 {
+        let level = levels[pos] as i32;
+        out[pos] = if level == 0 {
+            0.0
+        } else {
+            let magnitude = (2 * level.abs() + 1) * weight_scale[pos] * quantiser_scale / 32;
+            mpeg1_coefficient(magnitude, level.signum())
+        };
+    }
+}
+
 /// Orthonormal 8-point DCT basis, indexed by sample then frequency.
 static DCT8_BASIS: LazyLock<[f32; 64]> = LazyLock::new(|| {
     let mut basis = [0.0; 64];
@@ -406,6 +452,40 @@ pub fn frame_dct_to_field_targets(
 mod tests {
     use super::*;
     use crate::mpeg2::constants::{DEFAULT_INTRA_QUANT, DEFAULT_NON_INTRA_QUANT};
+
+    #[test]
+    fn mpeg1_intra_oddifies_ac_but_not_dc_or_uncoded_coefficients() {
+        let mut levels = [0; 64];
+        levels[0] = 128;
+        levels[1] = 4;
+        levels[2] = -4;
+        let mut out = [99.0; 64];
+        mpeg1_intra_targets(&levels, &[16; 64], 8, &mut out);
+        assert_eq!(out[0], 1024.0 - FLAT_PREDICTION_DC);
+        assert_eq!(out[1], 31.0);
+        assert_eq!(out[2], -31.0);
+        assert!(out[3..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn mpeg1_inter_corrects_each_coefficient_before_saturation() {
+        let mut levels = [0; 64];
+        levels[..6].copy_from_slice(&[1, -1, 2, -2, 255, -255]);
+        let mut out = [99.0; 64];
+        mpeg1_inter_targets(&levels, &[16; 64], 16, &mut out);
+        assert_eq!(&out[..6], &[23.0, -23.0, 39.0, -39.0, 2047.0, -2048.0]);
+        assert!(out[6..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn mpeg1_truncates_magnitudes_before_oddification() {
+        let mut levels = [0; 64];
+        levels[..4].copy_from_slice(&[1, -1, 2, -2]);
+        let mut out = [0.0; 64];
+        // scale_code=1, matrix=17: raw magnitudes are 3.1875 and 5.3125.
+        mpeg1_inter_targets(&levels, &[17; 64], 2, &mut out);
+        assert_eq!(&out[..4], &[3.0, -3.0, 5.0, -5.0]);
+    }
 
     #[test]
     fn doubling_the_mpeg2_step_is_exactly_six_h264_qp() {

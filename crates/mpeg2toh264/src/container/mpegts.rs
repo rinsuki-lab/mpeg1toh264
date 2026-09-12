@@ -1,4 +1,4 @@
-//! Minimal MPEG-TS demuxing for MPEG-2 video and AAC-LC audio.
+//! Minimal MPEG-TS demuxing for MPEG-1/2 video and AAC-LC audio.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -7,6 +7,7 @@ use crate::error::{bail, Result};
 
 const TS_PACKET_SIZE: usize = 188;
 const SYNC_BYTE: u8 = 0x47;
+const STREAM_TYPE_MPEG1_VIDEO: u8 = 0x01;
 const STREAM_TYPE_MPEG2_VIDEO: u8 = 0x02;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0f;
 const MIN_SYNC_COUNT: usize = 6;
@@ -530,7 +531,12 @@ impl ProgramMap {
                 }
                 let descriptors = &section[info_start..info_end];
                 let tag = component_tag(descriptors);
-                if video.is_none() && stream_type == STREAM_TYPE_MPEG2_VIDEO {
+                if video.is_none()
+                    && matches!(
+                        stream_type,
+                        STREAM_TYPE_MPEG1_VIDEO | STREAM_TYPE_MPEG2_VIDEO
+                    )
+                {
                     video = Some(stream_pid);
                 }
                 if stream_type == STREAM_TYPE_AAC_ADTS {

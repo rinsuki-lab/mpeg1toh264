@@ -56,6 +56,8 @@ pub struct SpsConfig {
     pub max_dec_frame_buffering: Option<u32>,
     /// Pixel width:height ratio carried in VUI.
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
+    /// Preserve MPEG-1 centered 4:2:0 chroma; false keeps MPEG-2 left siting.
+    pub centered_chroma: bool,
 }
 
 pub struct PpsConfig<'a> {
@@ -187,7 +189,7 @@ pub fn write_sps(cfg: &SpsConfig) -> Vec<u8> {
     }
     let reorder = cfg.max_num_reorder_frames;
     let sar = cfg.sample_aspect_ratio;
-    let vui = reorder.is_some() || sar.is_some();
+    let vui = reorder.is_some() || sar.is_some() || cfg.centered_chroma;
     w.flag(vui); // vui_parameters_present_flag
     if vui {
         w.flag(sar.is_some()); // aspect_ratio_info_present_flag
@@ -198,7 +200,11 @@ pub fn write_sps(cfg: &SpsConfig) -> Vec<u8> {
         }
         w.flag(false); // overscan_info_present_flag
         w.flag(false); // video_signal_type_present_flag
-        w.flag(false); // chroma_loc_info_present_flag
+        w.flag(cfg.centered_chroma); // chroma_loc_info_present_flag
+        if cfg.centered_chroma {
+            w.ue(1); // chroma_sample_loc_type_top_field: center
+            w.ue(1); // chroma_sample_loc_type_bottom_field: center
+        }
         w.flag(false); // timing_info_present_flag
         w.flag(false); // nal_hrd_parameters_present_flag
         w.flag(false); // vcl_hrd_parameters_present_flag

@@ -17,7 +17,9 @@ use std::sync::LazyLock;
 
 use crate::h264::cos_table::COS_PI_OVER_16;
 use crate::h264::params::ZIGZAG_4X4;
-use crate::h264::quant::{inter_targets, intra_targets, FLAT_PREDICTION_DC};
+use crate::h264::quant::{
+    inter_targets, intra_targets, mpeg1_inter_targets, mpeg1_intra_targets, FLAT_PREDICTION_DC,
+};
 use crate::h264::quant_tables::{CHROMA_AC_GAIN_4X4, CHROMA_DC_GAIN, QPC_FROM_QPI};
 use crate::round_half_up_i32;
 
@@ -191,12 +193,19 @@ fn dequant_chroma(
     intra_dc_precision: u32,
     intra: bool,
     out: &mut [f32; 64],
+    is_mpeg1: bool,
 ) {
     let Some(levels) = levels else {
         out.fill(0.0);
         return;
     };
-    if intra {
+    if is_mpeg1 {
+        if intra {
+            mpeg1_intra_targets(levels, weight_scale, quantiser_scale, out);
+        } else {
+            mpeg1_inter_targets(levels, weight_scale, quantiser_scale, out);
+        }
+    } else if intra {
         intra_targets(
             levels,
             weight_scale,
@@ -261,6 +270,7 @@ pub fn convert_field_chroma_pair(
             upper.intra_dc_precision,
             upper.intra,
             &mut scratch.upper_coeff,
+            false,
         );
         idct8(
             &scratch.upper_coeff,
@@ -278,6 +288,7 @@ pub fn convert_field_chroma_pair(
             lower.intra_dc_precision,
             lower.intra,
             &mut scratch.lower_coeff,
+            false,
         );
         idct8(
             &scratch.lower_coeff,
@@ -314,6 +325,7 @@ pub fn convert_chroma_block(
     out: &mut ChromaBlockLevels,
     intra: bool,
     field_scan: bool,
+    is_mpeg1: bool,
 ) {
     let mut dequant = [0.0f32; 64];
     let mut spatial = [0.0f32; 64];
@@ -326,6 +338,7 @@ pub fn convert_chroma_block(
         intra_dc_precision,
         intra,
         &mut dequant,
+        is_mpeg1,
     );
     idct8(&dequant, &mut spatial, &mut tmp);
     spatial_to_chroma_levels(&spatial, qp_c, out, field_scan);
@@ -347,6 +360,7 @@ pub fn convert_intra_chroma_block(
     prediction: &[i32; 4],
     out: &mut ChromaBlockLevels,
     field_scan: bool,
+    is_mpeg1: bool,
 ) {
     let mut dequant = [0.0f32; 64];
     let mut spatial = [0.0f32; 64];
@@ -359,6 +373,7 @@ pub fn convert_intra_chroma_block(
         intra_dc_precision,
         true,
         &mut dequant,
+        is_mpeg1,
     );
     idct8(&dequant, &mut spatial, &mut tmp);
     for (i, sample) in spatial.iter_mut().enumerate() {
@@ -371,6 +386,25 @@ pub fn convert_intra_chroma_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chroma_dequantisation_selects_the_source_mismatch_rule() {
+        let mut levels = [0; 64];
+        levels[0] = 127;
+        levels[1] = 4;
+        let mut out = [0.0; 64];
+        dequant_chroma(Some(&levels), &[16; 64], 8, 0, true, &mut out, true);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[1], 31.0);
+        assert_eq!(out[63], 0.0);
+        dequant_chroma(Some(&levels), &[16; 64], 8, 0, true, &mut out, false);
+        assert_eq!(out[1], 32.0);
+        assert_eq!(out[63], 1.0);
+        levels[0] = 0;
+        dequant_chroma(Some(&levels), &[16; 64], 8, 0, false, &mut out, true);
+        assert_eq!(out[1], 35.0);
+        assert_eq!(out[63], 0.0);
+    }
 
     /// Table 8-13, written as the column and row each entry names.
     #[test]
@@ -421,7 +455,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = 8 * 60; // DC only, at intra_dc_precision 0 this is 60 per sample
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, false, false);
+        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, false, false, false);
         assert!(out.any_dc, "the flat level lands on the DC block");
         assert!(!out.any_ac, "a constant block has no AC content");
         assert_eq!(&out.dc[1..], &[0, 0, 0], "only the Hadamard DC is non-zero");
@@ -434,7 +468,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[0] = (FLAT_PREDICTION_DC / 8.0) as i16;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, true, false);
+        convert_chroma_block(&levels, &[16; 64], 8, 0, 26, &mut out, true, false, false);
         assert!(
             out.is_empty(),
             "the residual against a flat prediction is zero"
@@ -446,7 +480,7 @@ mod tests {
         let mut levels = [0i16; 64];
         levels[5] = 400;
         let mut out = ChromaBlockLevels::default();
-        convert_chroma_block(&levels, &[16; 64], 16, 0, 20, &mut out, false, false);
+        convert_chroma_block(&levels, &[16; 64], 16, 0, 20, &mut out, false, false, false);
         assert!(!out.is_empty(), "the fixture actually codes something");
         out.clear();
         assert!(out.is_empty());

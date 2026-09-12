@@ -154,6 +154,38 @@ pub fn sequence_sample_aspect_ratio(sequence: &SequenceHeader) -> Option<SampleA
     Some(SampleAspectRatio { width, height })
 }
 
+/// MPEG-1 signals pel height/width, unlike MPEG-2's display aspect ratio.
+fn source_sample_aspect_ratio(
+    sequence: &SequenceHeader,
+    is_mpeg1: bool,
+) -> Option<SampleAspectRatio> {
+    if !is_mpeg1 {
+        return sequence_sample_aspect_ratio(sequence);
+    }
+    let pel_height = match sequence.aspect_ratio_information {
+        1 => 10000,
+        2 => 6735,
+        3 => 7031,
+        4 => 7615,
+        5 => 8055,
+        6 => 8437,
+        7 => 8935,
+        8 => 9157,
+        9 => 9815,
+        10 => 10255,
+        11 => 10695,
+        12 => 10950,
+        13 => 11575,
+        14 => 12015,
+        _ => return None,
+    };
+    let divisor = gcd(10000, pel_height);
+    Some(SampleAspectRatio {
+        width: 10000 / divisor,
+        height: pel_height / divisor,
+    })
+}
+
 /// What the H.264 parameter sets and the MP4 initialization segment are built
 /// out of, as the sequence header states it.
 ///
@@ -180,6 +212,8 @@ pub struct SequenceDescription {
     /// declares in the SPS.
     pub mbaff: bool,
     pub sample_aspect_ratio: Option<SampleAspectRatio>,
+    /// MPEG-1 places chroma at the center of each 2x2 luma group.
+    pub centered_chroma: bool,
 }
 
 /// The description one already-parsed picture was coded under.
@@ -188,7 +222,8 @@ pub fn picture_sequence_description(picture: &Picture) -> SequenceDescription {
         width: picture.sequence.horizontal_size,
         height: picture.sequence.vertical_size,
         mbaff: !picture.sequence_ext.progressive_sequence,
-        sample_aspect_ratio: sequence_sample_aspect_ratio(&picture.sequence),
+        centered_chroma: picture.is_mpeg1,
+        sample_aspect_ratio: source_sample_aspect_ratio(&picture.sequence, picture.is_mpeg1),
     }
 }
 
@@ -238,7 +273,11 @@ pub fn stream_sequence_description(data: &[u8]) -> Option<SequenceDescription> {
                     width: sequence.horizontal_size,
                     height: sequence.vertical_size,
                     mbaff: !progressive_sequence,
-                    sample_aspect_ratio: sequence_sample_aspect_ratio(&sequence),
+                    centered_chroma: sequence_ext.is_none(),
+                    sample_aspect_ratio: source_sample_aspect_ratio(
+                        &sequence,
+                        sequence_ext.is_none(),
+                    ),
                 });
             }
         }
@@ -334,6 +373,8 @@ pub struct Slice {
 
 #[derive(Clone, Debug)]
 pub struct Picture {
+    /// No sequence extension was present: use MPEG-1 syntax and inverse quantisation.
+    pub is_mpeg1: bool,
     /// True when a `group_of_pictures_header` preceded this picture, which is
     /// where `temporal_reference` restarts. Coded order alone cannot tell:
     /// within a group `temporal_reference` already runs backwards whenever B
@@ -624,6 +665,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
             };
             let header = read_picture_header(&mut r);
             pictures.push(Picture {
+                is_mpeg1: seq_ext.is_none(),
                 starts_gop: saw_gop_header,
                 coding: PictureCodingExtension::mpeg1_default(&header),
                 header,
@@ -641,7 +683,7 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
         } else if (start_code::SLICE_MIN..=start_code::SLICE_MAX).contains(&sc.code) {
             let Some(index) = current else { continue };
             let mut vertical_position = sc.code as u32;
-            if pictures[index].sequence.vertical_size > 2800 {
+            if !pictures[index].is_mpeg1 && pictures[index].sequence.vertical_size > 2800 {
                 vertical_position += r.u(3) << 7; // slice_vertical_position_extension
             }
             let quantiser_scale_code = r.u(5);
@@ -672,4 +714,133 @@ pub fn parse_elementary_stream(data: &[u8]) -> Result<Vec<Picture>> {
         }
     }
     Ok(pictures)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h264::bitwriter::BitWriter;
+
+    // Header-only elementary streams exercise version detection without a
+    // video encoder or any dependency on coefficient decoding.
+    fn headers(mpeg2: bool, aspect: u32) -> Vec<u8> {
+        let mut stream = vec![0, 0, 1, 0xb3];
+        let mut w = BitWriter::new();
+        for (n, value) in [
+            (12, 640),
+            (12, 480),
+            (4, aspect),
+            (4, 3),
+            (18, 1),
+            (1, 1),
+            (10, 1),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ] {
+            w.u(n, value);
+        }
+        stream.extend_from_slice(w.bytes());
+        if mpeg2 {
+            stream.extend_from_slice(&[0, 0, 1, 0xb5]);
+            w.clear();
+            for (n, value) in [
+                (4, 1),
+                (8, 0x48),
+                (1, 1),
+                (2, 1),
+                (2, 0),
+                (2, 0),
+                (12, 0),
+                (1, 1),
+                (8, 0),
+                (1, 0),
+                (2, 0),
+                (5, 0),
+            ] {
+                w.u(n, value);
+            }
+            stream.extend_from_slice(w.bytes());
+        }
+        stream.extend_from_slice(&[0, 0, 1, 0]);
+        w.clear();
+        w.u(10, 0);
+        w.u(3, 1);
+        w.u(16, 0xffff);
+        w.u(1, 0);
+        w.u(2, 0); // byte alignment before the next start code
+        stream.extend_from_slice(w.bytes());
+        stream
+    }
+
+    #[test]
+    fn sequence_extension_selects_version_and_aspect_semantics() {
+        for (mpeg2, expected) in [
+            (
+                false,
+                SampleAspectRatio {
+                    width: 10000,
+                    height: 7031,
+                },
+            ),
+            (
+                true,
+                SampleAspectRatio {
+                    width: 4,
+                    height: 3,
+                },
+            ),
+        ] {
+            let data = headers(mpeg2, 3);
+            let pictures = parse_elementary_stream(&data).unwrap();
+            assert_eq!(pictures.len(), 1);
+            assert_eq!(pictures[0].is_mpeg1, !mpeg2);
+            let parsed = picture_sequence_description(&pictures[0]);
+            let peeked = stream_sequence_description(&data).unwrap();
+            assert_eq!(parsed.sample_aspect_ratio, Some(expected));
+            assert_eq!(parsed.centered_chroma, !mpeg2);
+            assert_eq!(peeked, parsed);
+        }
+    }
+
+    #[test]
+    fn chroma_siting_alone_changes_the_sequence_description() {
+        let mpeg1 = stream_sequence_description(&headers(false, 1)).unwrap();
+        let mpeg2 = stream_sequence_description(&headers(true, 1)).unwrap();
+        assert_eq!(mpeg1.sample_aspect_ratio, mpeg2.sample_aspect_ratio);
+        assert_eq!(mpeg1.width, mpeg2.width);
+        assert_eq!(mpeg1.height, mpeg2.height);
+        assert_eq!(mpeg1.mbaff, mpeg2.mbaff);
+        assert_ne!(mpeg1, mpeg2);
+    }
+
+    #[test]
+    fn mpeg1_square_pels_and_reserved_aspects() {
+        for (aspect, expected) in [
+            (
+                1,
+                Some(SampleAspectRatio {
+                    width: 1,
+                    height: 1,
+                }),
+            ),
+            (
+                14,
+                Some(SampleAspectRatio {
+                    width: 2000,
+                    height: 2403,
+                }),
+            ),
+            (0, None),
+            (15, None),
+        ] {
+            let data = headers(false, aspect);
+            assert_eq!(
+                stream_sequence_description(&data)
+                    .unwrap()
+                    .sample_aspect_ratio,
+                expected
+            );
+        }
+    }
 }

@@ -42,7 +42,7 @@ use crate::h264::params::{
 use crate::h264::params::{ZIGZAG_4X4, ZIGZAG_8X8};
 use crate::h264::quant::{
     field_dct_to_frame_targets, frame_dct_to_field_targets, inter_targets, intra_targets,
-    Quantiser8x8, DEFAULT_OVERSAMPLE, FLAT_PREDICTION_DC,
+    mpeg1_inter_targets, mpeg1_intra_targets, Quantiser8x8, DEFAULT_OVERSAMPLE, FLAT_PREDICTION_DC,
 };
 use crate::h264::reconstruct::{
     chroma_dc_terms, chroma_residual_4x4, residual_8x8, InverseScale8x8,
@@ -415,6 +415,7 @@ pub fn plan_unit(
             max_num_reorder_frames: Some(1),
             max_dec_frame_buffering: Some(4),
             sample_aspect_ratio: description.sample_aspect_ratio,
+            centered_chroma: description.centered_chroma,
         })));
         description_parts.push(Part::Literal(write_pps(&PpsConfig {
             init_qp: PPS_INIT_QP,
@@ -2536,7 +2537,11 @@ fn write_picture(
                         let Some(block) = source.block(b) else {
                             continue;
                         };
-                        if intra {
+                        if source_pic.is_mpeg1 && intra {
+                            mpeg1_intra_targets(block, matrix, quantiser_scale, target);
+                        } else if source_pic.is_mpeg1 {
+                            mpeg1_inter_targets(block, matrix, quantiser_scale, target);
+                        } else if intra {
                             intra_targets(
                                 block,
                                 matrix,
@@ -2621,6 +2626,7 @@ fn write_picture(
                                 prediction,
                                 &mut chroma_scratch[c],
                                 direct_field_pair,
+                                source_pic.is_mpeg1,
                             ),
                             (Some(block), None) => convert_chroma_block(
                                 block,
@@ -2631,6 +2637,7 @@ fn write_picture(
                                 &mut chroma_scratch[c],
                                 intra,
                                 direct_field_pair,
+                                source_pic.is_mpeg1,
                             ),
                             (None, _) => chroma_scratch[c].clear(),
                         }

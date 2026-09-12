@@ -341,6 +341,74 @@ fn mirror_single_vector_predictors(pmv: &mut [i32; 8], forward: bool, backward: 
     }
 }
 
+fn escape_level(r: &mut BitReader<'_>, is_mpeg1: bool) -> Result<i32> {
+    if is_mpeg1 {
+        // ISO/IEC 11172-2: the 8-bit values 0 and -128 introduce a second
+        // byte. MPEG-2 instead always carries a signed 12-bit level.
+        let level = match r.u(8) as i32 {
+            0 => r.u(8) as i32,
+            128 => r.u(8) as i32 - 256,
+            raw if raw >= 128 => raw - 256,
+            raw => raw,
+        };
+        if level == 0 || level == -256 {
+            bail!("invalid MPEG-1 escape level {level}");
+        }
+        Ok(level)
+    } else {
+        let raw = r.u(12) as i32;
+        Ok(if raw >= 2048 { raw - 4096 } else { raw })
+    }
+}
+
+fn address_increment(r: &mut BitReader<'_>, is_mpeg1: bool) -> Result<Option<i32>> {
+    let mut increment = 0;
+    loop {
+        // MPEG-1 permits macroblock_stuffing before an increment, including
+        // between escapes. Keep it out of the generated H.262 VLC table.
+        while is_mpeg1 && r.peek(11) == 0b00000001111 {
+            r.skip(11);
+        }
+        let Some(sym) = V_MB_ADDR.decode_or_zero_stuffing(r)? else {
+            if increment != 0 {
+                bail!("unterminated macroblock address escape");
+            }
+            return Ok(None);
+        };
+        if sym == MB_ADDR_ESCAPE {
+            increment += 33;
+        } else {
+            return Ok(Some(increment + sym));
+        }
+    }
+}
+
+fn full_pel_to_half_pel(mv: &mut [i32; 8], forward: bool, backward: bool) {
+    for vector in mv.chunks_exact_mut(4) {
+        if forward {
+            vector[0] *= 2;
+            vector[1] *= 2;
+        }
+        if backward {
+            vector[2] *= 2;
+            vector[3] *= 2;
+        }
+    }
+}
+
+fn normalize_motion(mb: &mut Macroblock, pic: &Picture) {
+    if pic.is_mpeg1 {
+        // PMV stays in the units used by the source VLCs. Only the completed
+        // macroblock is converted to the half-pel units the H.264 mapper uses;
+        // this also covers skipped B macroblocks that inherit those PMVs.
+        full_pel_to_half_pel(
+            &mut mb.mv,
+            pic.header.full_pel_forward_vector,
+            pic.header.full_pel_backward_vector,
+        );
+    }
+}
+
 /// Decode the block layer: run/level pairs into an 8x8 array of levels.
 fn decode_block(
     r: &mut BitReader<'_>,
@@ -396,8 +464,7 @@ fn decode_block(
         }
         let (run, level) = if sym == ESCAPE {
             let run = r.u(6) as usize;
-            let raw = r.u(12) as i32;
-            (run, if raw >= 2048 { raw - 4096 } else { raw })
+            (run, escape_level(r, pic.is_mpeg1)?)
         } else {
             let run = (sym >> 8) as usize;
             let mut level = sym & 0xff;
@@ -446,25 +513,16 @@ pub fn decode_slice(
     // current position. decode_or_zero_stuffing folds that check into the first
     // address VLC lookup, avoiding two reads from every normal boundary.
     loop {
-        let mut increment = 0i32;
-        let Some(mut sym) = V_MB_ADDR.decode_or_zero_stuffing(r)? else {
+        let Some(increment) = address_increment(r, pic.is_mpeg1)? else {
             break;
         };
-        loop {
-            if sym == MB_ADDR_ESCAPE {
-                increment += 33;
-                sym = V_MB_ADDR.decode(r)?;
-                continue;
-            }
-            increment += sym;
-            break;
-        }
 
         // Everything between the previous macroblock and this one is skipped.
         for _ in 1..increment {
             address += 1;
             let at = address as usize;
             make_skipped(grid.slot(at), at, &mut state, picture_type, frame);
+            normalize_motion(grid.slot(at), pic);
             grid.mark(at);
         }
         address += 1;
@@ -472,6 +530,7 @@ pub fn decode_slice(
         let at = address as usize;
         let mb = grid.slot(at);
         decode_macroblock(r, pic, &mut state, at, frame, mb)?;
+        normalize_motion(mb, pic);
         state.prev_flags = Some(mb.flags);
         grid.mark(at);
     }
@@ -667,7 +726,66 @@ fn decode_macroblock(
 
 #[cfg(test)]
 mod tests {
-    use super::mirror_single_vector_predictors;
+    use super::*;
+
+    fn bits(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0; text.len().div_ceil(8) + 4];
+        for (i, bit) in text.bytes().enumerate() {
+            assert!(bit == b'0' || bit == b'1');
+            bytes[i / 8] |= (bit - b'0') << (7 - i % 8);
+        }
+        bytes
+    }
+
+    #[test]
+    fn mpeg1_escape_levels_consume_their_variable_width() {
+        for (encoded, expected) in [
+            ("00000001", 1),
+            ("01111111", 127),
+            ("11111111", -1),
+            ("10000001", -127),
+            ("0000000010000000", 128),
+            ("0000000011111111", 255),
+            ("1000000000000001", -255),
+            ("1000000010000000", -128),
+        ] {
+            let data = bits(&format!("{encoded}10"));
+            let mut r = BitReader::new(&data);
+            assert_eq!(escape_level(&mut r, true).unwrap(), expected);
+            assert_eq!(r.bit_pos(), encoded.len());
+            assert_eq!(V_COEFF0.decode(&mut r).unwrap(), EOB);
+        }
+        let data = bits("11111000000010");
+        let mut r = BitReader::new(&data);
+        assert_eq!(escape_level(&mut r, false).unwrap(), -128);
+        assert_eq!(r.bit_pos(), 12);
+        assert_eq!(V_COEFF0.decode(&mut r).unwrap(), EOB);
+        for invalid in ["0000000000000000", "1000000000000000"] {
+            let data = bits(invalid);
+            assert!(escape_level(&mut BitReader::new(&data), true).is_err());
+        }
+    }
+
+    #[test]
+    fn mpeg1_stuffing_can_surround_macroblock_address_escapes() {
+        let data = bits("000000011110000000100000000001111011");
+        let mut r = BitReader::new(&data);
+        assert_eq!(address_increment(&mut r, true).unwrap(), Some(35));
+        assert_eq!(r.bit_pos(), 36);
+        assert_eq!(address_increment(&mut r, true).unwrap(), None);
+        assert!(address_increment(&mut BitReader::new(&data), false).is_err());
+    }
+
+    #[test]
+    fn full_pel_vectors_scale_each_direction_independently() {
+        let original = [1, -2, 3, -4, 5, -6, 7, -8];
+        let mut mv = original;
+        full_pel_to_half_pel(&mut mv, true, false);
+        assert_eq!(mv, [2, -4, 3, -4, 10, -12, 7, -8]);
+        let mut mv = original;
+        full_pel_to_half_pel(&mut mv, false, true);
+        assert_eq!(mv, [1, -2, 6, -8, 5, -6, 14, -16]);
+    }
 
     #[test]
     fn one_vector_motion_updates_both_r_predictors() {

@@ -104,6 +104,7 @@ struct Sps {
     crop: Option<[u32; 4]>,
     aspect_ratio_idc: Option<u32>,
     sar: Option<(u32, u32)>,
+    chroma_location: Option<(u32, u32)>,
     max_num_reorder_frames: Option<u32>,
     max_dec_frame_buffering: Option<u32>,
 }
@@ -159,7 +160,9 @@ fn parse_sps(nal: &[u8]) -> Sps {
         }
         r.flag(); // overscan_info_present_flag
         r.flag(); // video_signal_type_present_flag
-        r.flag(); // chroma_loc_info_present_flag
+        if r.flag() {
+            sps.chroma_location = Some((r.ue(), r.ue()));
+        }
         r.flag(); // timing_info_present_flag
         r.flag(); // nal_hrd_parameters_present_flag
         r.flag(); // vcl_hrd_parameters_present_flag
@@ -190,6 +193,7 @@ fn sample_sps(sar: Option<SampleAspectRatio>) -> SpsConfig {
         max_num_reorder_frames: Some(1),
         max_dec_frame_buffering: Some(4),
         sample_aspect_ratio: sar,
+        centered_chroma: false,
     }
 }
 
@@ -310,4 +314,21 @@ fn pps_carries_the_mpeg2_quantiser_matrices_as_8x8_scaling_lists() {
         );
     }
     assert_eq!(r.se(), -6, "second_chroma_qp_index_offset");
+}
+
+#[test]
+fn sps_preserves_mpeg1_centered_chroma_even_without_other_vui() {
+    for reorder in [None, Some(1)] {
+        let mut cfg = sample_sps(None);
+        cfg.centered_chroma = true;
+        cfg.max_num_reorder_frames = reorder;
+        let sps = parse_sps(&write_sps(&cfg));
+        assert_eq!(sps.chroma_location, Some((1, 1)));
+        assert_eq!(sps.sar, None);
+        assert_eq!(sps.max_num_reorder_frames, reorder);
+        cfg.centered_chroma = false;
+        let sps = parse_sps(&write_sps(&cfg));
+        assert_eq!(sps.chroma_location, None);
+        assert_eq!(sps.max_num_reorder_frames, reorder);
+    }
 }

@@ -4,8 +4,7 @@ use crate::container::adts::{AacConfig, AAC_FRAME_SAMPLES};
 use crate::error::{bail, Result};
 use crate::mpeg2::constants::{start_code, PictureStructure, PictureType, FRAME_RATE};
 use crate::mpeg2::headers::{
-    parse_elementary_stream, picture_sequence_description, sequence_sample_aspect_ratio,
-    Interlacing, Picture, SampleAspectRatio,
+    parse_elementary_stream, picture_sequence_description, Interlacing, Picture, SampleAspectRatio,
 };
 use crate::round_half_up;
 use crate::TranscodeOptions;
@@ -615,7 +614,7 @@ fn walk_pictures(data: &[u8], has_references: bool, undecodable: &[bool]) -> Res
             presentation_indices,
             field_pairs,
             split_field_samples: TranscodeOptions::default().split_field_samples,
-            sample_aspect_ratio: sequence_sample_aspect_ratio(&first.sequence),
+            sample_aspect_ratio: picture_sequence_description(first).sample_aspect_ratio,
             hold_ticks: 0,
         },
         samples,

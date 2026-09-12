@@ -32,6 +32,37 @@ fn recovers_the_elementary_stream_byte_for_byte() {
 }
 
 #[test]
+fn selects_mpeg1_video_from_the_program_map() {
+    use support::{mux_transport_stream, PesUnit};
+
+    // Demuxing must preserve bytes regardless of which MPEG video syntax the
+    // payload uses. A different video type must not steal the selected PID.
+    let es = read_fixture("ip.m2v");
+    let ts = mux_transport_stream(
+        &[(0x101, 0x1b), (0x102, 0x01)],
+        &[
+            PesUnit {
+                pid: 0x101,
+                stream_id: 0xe0,
+                pts: Some(9000),
+                payload: &es,
+            },
+            PesUnit {
+                pid: 0x102,
+                stream_id: 0xe0,
+                pts: Some(18000),
+                payload: &es,
+            },
+        ],
+        &mut HashMap::new(),
+    );
+    assert_eq!(
+        extract_mpeg2_video_es(&ts).expect("MPEG-1 PID selected"),
+        es
+    );
+}
+
+#[test]
 fn skips_a_packet_with_reserved_adaptation_field_control() {
     let es = read_fixture("ibbp.m2v");
     let mut ts = wrap_mpeg2_es_in_ts(&es, None, &mut HashMap::new());
